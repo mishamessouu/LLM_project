@@ -2,34 +2,53 @@ import os
 import json
 import getpass
 import sqlite3
+from pathlib import Path
 import gradio as gr
 from openai import OpenAI
+# Debug logging flag (set SQL_DEBUG=0 to disable)
+SQL_DEBUG = os.getenv("SQL_DEBUG", "1").lower() in ("1", "true", "yes")
 
 
-# OpenAI client
-client = OpenAI()
+def _log(*args):
+    if SQL_DEBUG:
+        print("[SQLBot]", *args)
 
 
-# Ensure OPENAI_API_KEY is set
+# Load environment variables from .env if present (optional)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    # search from current file upward
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
+    load_dotenv(override=False)  # also load from CWD if any
+except Exception:
+    pass
+
+# Ensure OPENAI_API_KEY is set (prompt as last resort in interactive shell)
 if not os.environ.get("OPENAI_API_KEY"):
-    os.environ["OPENAI_API_KEY"] = getpass.getpass("Enter API key for OpenAI: ")
+    try:
+        os.environ["OPENAI_API_KEY"] = getpass.getpass("Enter API key for OpenAI: ")
+    except Exception:
+        # non-interactive context, leave unset so we can error later with a clear message
+        pass
+
+# OpenAI client (after env is loaded)
+client = OpenAI()
+_log("OPENAI_API_KEY loaded:", bool(os.environ.get("OPENAI_API_KEY")))
 
 
-# World Happiness Report SQL schema (example)
 SCHEMA = """
 Table: happiness
 Columns:
-  - country TEXT
-  - year INTEGER
-  - happiness_score REAL           -- overall life evaluation (0-10)
-  - gdp_per_capita REAL
-  - social_support REAL
-  - healthy_life_expectancy REAL
-  - freedom_to_make_life_choices REAL
-  - generosity REAL
-  - perceptions_of_corruption REAL
-  - rank INTEGER                   -- rank in that year (1 = highest)
-  - continent TEXT                 -- optional; if present in your DB
+    - "Overall rank" INTEGER
+    - "Country or region" TEXT
+    - "Score" REAL
+    - "GDP per capita" REAL
+    - "Social support" REAL
+    - "Healthy life expectancy" REAL
+    - "Freedom to make life choices" REAL
+    - "Generosity" REAL
+    - "Perceptions of corruption" REAL
+    - "year" INTEGER
 """
 
 
@@ -39,7 +58,8 @@ SYSTEM_SQL = (
     "Follow rules: (1) Output only SQL; no code fences or commentary. "
     "(2) Use only tables/columns from the schema. (3) Prefer safe SELECT queries; "
     "never write INSERT/UPDATE/DELETE/DROP. (4) If the request is ambiguous, choose a "
-    "reasonable interpretation and include clear filters/aggregations."
+    "reasonable interpretation and include clear filters/aggregations. "
+    "(5) Because column names include spaces, always double-quote identifiers, e.g., \"Score\", \"Overall rank\", \"year\"."
 )
 
 
@@ -63,6 +83,8 @@ def generate_sql(user_question: str) -> str:
     # Ensure no backticks
     if sql.startswith("```"):
         sql = sql.strip("`\n ")
+    _log("Generated SQL for question:", user_question)
+    _log(sql)
     return sql
 
 
@@ -71,24 +93,42 @@ def execute_sql(sql: str, max_rows: int = 200):
     The DB file path should be provided via env var HAPPINESS_DB_PATH.
     Returns (columns: list[str], rows: list[list|tuple]) or (None, None) if unavailable.
     """
+    # Resolve DB path with fallbacks
     db_path = os.getenv("HAPPINESS_DB_PATH")
     if not db_path:
+        # common local paths based on your preprocessing scripts
+        candidates = [
+            os.path.join("preprocessing", "happiness.db"),
+            os.path.join(".", "happiness.db"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                db_path = c
+                break
+    if not db_path:
+        _log("No DB path found; set HAPPINESS_DB_PATH if you want execution previews.")
         return None, None
     if not os.path.exists(db_path):
+        _log("DB path does not exist:", db_path)
         return None, None
     # Only allow SELECT for safety
     if not sql.strip().lower().startswith("select"):
+        _log("Blocked non-SELECT statement:", sql.split("\n")[0][:120])
         return None, None
     try:
+        _log("Executing on DB:", db_path)
+        _log("SQL head:", sql.split("\n")[0][:200])
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute(sql)
         rows = cur.fetchmany(max_rows)
         columns = [desc[0] for desc in cur.description] if cur.description else []
         conn.close()
+        _log(f"Rows fetched: {len(rows)}; Columns: {columns}")
         return columns, rows
-    except Exception:
+    except Exception as e:
         # On any DB error, don't crash chat; just return None so we can still show SQL
+        _log("DB error during execution:", e)
         return None, None
 
 
@@ -140,7 +180,9 @@ def generate_explanation(question: str, sql: str, columns, rows) -> str:
         messages=messages,
         temperature=0,
     )
-    return resp.choices[0].message.content.strip()
+    explanation = resp.choices[0].message.content.strip()
+    _log("Generated explanation (first 200 chars):", explanation[:200])
+    return explanation
 
 def respond(message, image, history):
     if message is None:
@@ -165,9 +207,12 @@ def respond(message, image, history):
     preview_block = _preview_table(columns, rows) if columns is not None else "(DB not configured; set HAPPINESS_DB_PATH)"
     display = (
         f"Explanation:\n{explanation}\n\n"
-        f"SQL:\n```sql\n{sql}\n```\n\n"
-        f"Preview:\n{preview_block}"
+        #f"SQL:\n```sql\n{sql}\n```\n\n"
+        #f"Preview:\n{preview_block}"
     )
+
+    # Print the final payload to console for visibility
+    _log("Final response payload:\n" + display)
 
     history = history + [(message if message else "[Image]", display)]
     yield history
@@ -184,11 +229,11 @@ with gr.Blocks() as demo:
     # Example prompts
     gr.Examples(
         examples=[
-            "What were the top 5 happiest countries in 2021?",
-            "Show the average happiness_score by continent in 2019, sorted descending.",
-            "Which country improved its rank the most between 2015 and 2020?",
-            "List the top 10 countries by happiness_score and their gdp_per_capita in 2022.",
-            "For Finland, show happiness_score over time.",
+            "What were the top 5 happiest countries in 2019?",
+            "Show the average \"Score\" by year between 2015 and 2029, sorted descending.",
+            "Which country improved its rank the most between 2015 and 2019?",
+            "List the top 10 countries by \"Score\" and their \"GDP per capita\" in 2018.",
+            "For Finland, show \"Score\" over time.",
         ],
         inputs=msg,
     )
