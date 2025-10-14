@@ -156,9 +156,10 @@ def generate_explanation(question: str, sql: str, columns, rows) -> str:
         {
             "role": "system",
             "content": (
-                "You are a data analyst. Provide a concise, clear explanation of the SQL result "
+                "You are a data analyst. Provide a concise, clear explanation of the SQL result"
                 "for a non-technical user. If there is data, summarize key takeaways and any apparent trends; "
                 "if there is no data available, describe what the query intends to fetch."
+                "do not mention the SQL itself."
             ),
         },
         {
@@ -184,7 +185,7 @@ def generate_explanation(question: str, sql: str, columns, rows) -> str:
     _log("Generated explanation (first 200 chars):", explanation[:200])
     return explanation
 
-def respond(message, image, history):
+def respond(message, history):
     if message is None:
         message = ""
 
@@ -214,7 +215,7 @@ def respond(message, image, history):
     # Print the final payload to console for visibility
     _log("Final response payload:\n" + display)
 
-    history = history + [(message if message else "[Image]", display)]
+    history = history + [(message, display)]
     yield history
 
 
@@ -224,7 +225,6 @@ with gr.Blocks() as demo:
     chatbot = gr.Chatbot()
     with gr.Row():
         msg = gr.Textbox(placeholder="Ask a question about World Happiness (e.g., rankings, averages, trends)...", lines=2)
-        img = gr.Image(type="filepath", label="Optional image")
 
     # Example prompts
     gr.Examples(
@@ -241,11 +241,8 @@ with gr.Blocks() as demo:
     submit = gr.Button("Send")
     clear = gr.Button("Clear Chat")
 
-    # analyze image silently (not used for SQL)
-    img.upload(lambda p: None, [img], None)
-
-    submit.click(respond, [msg, img, chatbot], [chatbot])
-    msg.submit(respond, [msg, img, chatbot], [chatbot])
+    submit.click(respond, [msg, chatbot], [chatbot])
+    msg.submit(respond, [msg, chatbot], [chatbot])
     clear.click(lambda: [], None, chatbot)
 
 
