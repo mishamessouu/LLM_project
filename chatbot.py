@@ -54,7 +54,7 @@ SYSTEM_SQL = (
     "Always double-quote identifiers since they include spaces."
 )
 
-# --- Functions ---
+# Functions 
 def generate_sql(question):
     messages = [
         {"role": "system", "content": SYSTEM_SQL},
@@ -183,7 +183,7 @@ def respond(message, history):
     history = history + [(message, final)]
     return history
 
-# Custom Theme + CSS
+# CSS
 CSS = """
 body {background-color:#0e0f13 !important;}
 .gradio-container {max-width:850px !important;margin:auto;}
@@ -195,7 +195,7 @@ body {background-color:#0e0f13 !important;}
 #header {text-align:center;padding:20px 0;color:white;font-family:Inter,sans-serif;}
 """
 
-# --- Gradio UI ---
+# Gradio UI
 with gr.Blocks(css=CSS, analytics_enabled=False) as demo:
     gr.HTML("<h1 id='header'>World Happiness Chat</h1>")
     chatbot = gr.Chatbot(elem_id="chatbox", bubble_full_width=False, height=600)
