@@ -1,40 +1,35 @@
 import os
-import json
 import getpass
 import sqlite3
 from pathlib import Path
+import re
 import gradio as gr
 from openai import OpenAI
-# Debug logging flag (set SQL_DEBUG=0 to disable)
-SQL_DEBUG = os.getenv("SQL_DEBUG", "1").lower() in ("1", "true", "yes")
 
+# Debug flag
+SQL_DEBUG = os.getenv("SQL_DEBUG", "1").lower() in ("1", "true", "yes")
 
 def _log(*args):
     if SQL_DEBUG:
         print("[SQLBot]", *args)
 
-
-# Load environment variables from .env if present (optional)
+# Load .env if present
 try:
-    from dotenv import load_dotenv  # type: ignore
-    # search from current file upward
+    from dotenv import load_dotenv
     load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
-    load_dotenv(override=False)  # also load from CWD if any
+    load_dotenv(override=False)
 except Exception:
     pass
 
-# Ensure OPENAI_API_KEY is set (prompt as last resort in interactive shell)
+# Ensure API key
 if not os.environ.get("OPENAI_API_KEY"):
     try:
         os.environ["OPENAI_API_KEY"] = getpass.getpass("Enter API key for OpenAI: ")
     except Exception:
-        # non-interactive context, leave unset so we can error later with a clear message
         pass
 
-# OpenAI client (after env is loaded)
 client = OpenAI()
-_log("OPENAI_API_KEY loaded:", bool(os.environ.get("OPENAI_API_KEY")))
-
+_log("API key loaded:", bool(os.environ.get("OPENAI_API_KEY")))
 
 SCHEMA = """
 Table: happiness
@@ -51,200 +46,173 @@ Columns:
     - "year" INTEGER
 """
 
-
 SYSTEM_SQL = (
     "You convert natural language questions into a single ANSI SQL SELECT query "
     "for the provided World Happiness Report schema. "
-    "Follow rules: (1) Output only SQL; no code fences or commentary. "
-    "(2) Use only tables/columns from the schema. (3) Prefer safe SELECT queries; "
-    "never write INSERT/UPDATE/DELETE/DROP. (4) If the request is ambiguous, choose a "
-    "reasonable interpretation and include clear filters/aggregations. "
-    "(5) Because column names include spaces, always double-quote identifiers, e.g., \"Score\", \"Overall rank\", \"year\"."
+    "Rules: Output only SQL, no markdown. "
+    "Use only the given table/columns, and only SELECT statements. "
+    "Always double-quote identifiers since they include spaces."
 )
 
-
-def generate_sql(user_question: str) -> str:
+# --- Functions ---
+def generate_sql(question):
     messages = [
         {"role": "system", "content": SYSTEM_SQL},
-        {
-            "role": "user",
-            "content": (
-                "Schema:\n" + SCHEMA + "\n\nQuestion: " + user_question + "\n\nReturn only SQL."
-            ),
-        },
+        {"role": "user", "content": f"Schema:\n{SCHEMA}\n\nQuestion: {question}\nReturn only SQL."},
     ]
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0,
-    )
-    sql = resp.choices[0].message.content.strip()
-    # Ensure no backticks
-    if sql.startswith("```"):
-        sql = sql.strip("`\n ")
-    _log("Generated SQL for question:", user_question)
-    _log(sql)
+    resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0)
+    sql = resp.choices[0].message.content.strip().strip("`\n ")
+    _log("Generated SQL:", sql)
     return sql
 
+def _resolve_db_path():
+    # Priority: env var, CWD happiness.db, preprocessing/happiness.db relative to this file
+    env = os.getenv("HAPPINESS_DB_PATH")
+    if env and os.path.exists(env):
+        return env
+    cwd_default = os.path.join(os.getcwd(), "happiness.db")
+    if os.path.exists(cwd_default):
+        return cwd_default
+    alt = Path(__file__).resolve().parent / "preprocessing" / "happiness.db"
+    if alt.exists():
+        return str(alt)
+    return None
 
-def execute_sql(sql: str, max_rows: int = 200):
-    """Execute a read-only SQL query against a SQLite DB if configured.
-    The DB file path should be provided via env var HAPPINESS_DB_PATH.
-    Returns (columns: list[str], rows: list[list|tuple]) or (None, None) if unavailable.
-    """
-    # Resolve DB path with fallbacks
-    db_path = os.getenv("HAPPINESS_DB_PATH")
+
+def execute_sql(sql):
+    db_path = _resolve_db_path()
     if not db_path:
-        # common local paths based on your preprocessing scripts
-        candidates = [
-            os.path.join("preprocessing", "happiness.db"),
-            os.path.join(".", "happiness.db"),
-        ]
-        for c in candidates:
-            if os.path.exists(c):
-                db_path = c
-                break
-    if not db_path:
-        _log("No DB path found; set HAPPINESS_DB_PATH if you want execution previews.")
+        _log("No DB found. Set HAPPINESS_DB_PATH or place happiness.db in project or preprocessing/.")
         return None, None
-    if not os.path.exists(db_path):
-        _log("DB path does not exist:", db_path)
+    if not sql.lower().startswith("select"):
         return None, None
-    # Only allow SELECT for safety
-    if not sql.strip().lower().startswith("select"):
-        _log("Blocked non-SELECT statement:", sql.split("\n")[0][:120])
-        return None, None
+
     try:
-        _log("Executing on DB:", db_path)
-        _log("SQL head:", sql.split("\n")[0][:200])
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute(sql)
-        rows = cur.fetchmany(max_rows)
-        columns = [desc[0] for desc in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
         conn.close()
-        _log(f"Rows fetched: {len(rows)}; Columns: {columns}")
-        return columns, rows
+        _log(f"Executed on {db_path}, rows={len(rows)}")
+        return cols, rows
     except Exception as e:
-        # On any DB error, don't crash chat; just return None so we can still show SQL
-        _log("DB error during execution:", e)
+        _log("SQL error:", e)
         return None, None
 
+def preview_table(cols, rows, max_rows=8):
+    if not cols or not rows:
+        return "(no results)"
+    lines = [" | ".join(cols), " | ".join(["---"] * len(cols))]
+    for r in rows[:max_rows]:
+        lines.append(" | ".join(str(x) for x in r))
+    if len(rows) > max_rows:
+        lines.append(f"(+{len(rows)-max_rows} more rows...)")
+    return "\n".join(lines)
 
-def _preview_table(columns, rows, max_rows: int = 10) -> str:
-    if not columns or not rows:
-        return "(no rows)"
-    head = rows[:max_rows]
-    # Build a simple pipe-separated preview
-    lines = []
-    lines.append(" | ".join(map(str, columns)))
-    lines.append(" | ".join(["---"] * len(columns)))
-    for r in head:
-        # r may be tuple
-        lines.append(" | ".join(map(lambda x: str(x) if x is not None else "", r)))
-    more = "" if len(rows) <= max_rows else f"\n(+{len(rows)-max_rows} more rows truncated)"
-    return "\n".join(lines) + more
-
-
-def generate_explanation(question: str, sql: str, columns, rows) -> str:
-    """Use OpenAI to provide a concise explanation of the result.
-    If rows are present, summarize insights; otherwise, explain what the SQL would retrieve.
-    """
-    table_preview = _preview_table(columns, rows) if columns is not None else "(no data)"
+def explain_result(question, sql, cols, rows):
+    preview = preview_table(cols, rows)
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a data analyst. Provide a concise, clear explanation of the SQL result"
-                "for a non-technical user. If there is data, summarize key takeaways and any apparent trends; "
-                "if there is no data available, describe what the query intends to fetch."
-                "do not mention the SQL itself."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Question: "
-                + question
-                + "\n\nSQL:\n"
-                + sql
-                + "\n\nColumns: "
-                + (", ".join(columns) if columns else "")
-                + "\nSample rows (truncated):\n"
-                + table_preview
-            ),
-        },
+        {"role": "system", "content": "You are a friendly data analyst explaining SQL query results clearly."},
+        {"role": "user", "content": f"Question: {question}\n\nResult preview:\n{preview}"},
     ]
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0,
-    )
-    explanation = resp.choices[0].message.content.strip()
-    _log("Generated explanation (first 200 chars):", explanation[:200])
-    return explanation
+    resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
+    return resp.choices[0].message.content.strip()
+
+def _latest_available_year(conn):
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT MAX("year") FROM "happiness"')
+        r = cur.fetchone()
+        return r[0] if r and r[0] is not None else None
+    except Exception as e:
+        _log("Failed to get latest year:", e)
+        return None
+
+
+def _try_adjust_year(sql: str):
+    # If SQL filters by a specific year that has no rows, try swapping to the latest available year
+    m = re.search(r'WHERE\s+"year"\s*=\s*(\d{4})', sql, flags=re.IGNORECASE)
+    if not m:
+        return None, None
+    requested_year = int(m.group(1))
+    db_path = _resolve_db_path()
+    if not db_path:
+        return None, None
+    try:
+        conn = sqlite3.connect(db_path)
+        # Check if requested year has any rows
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM "happiness" WHERE "year" = ?', (requested_year,))
+        count = cur.fetchone()[0]
+        if count and count > 0:
+            conn.close()
+            return None, None
+        latest = _latest_available_year(conn)
+        conn.close()
+        if latest and latest != requested_year:
+            adjusted_sql = re.sub(r'(WHERE\s+"year"\s*=\s*)(\d{4})', f"\\g<1>{latest}", sql, flags=re.IGNORECASE)
+            return adjusted_sql, latest
+    except Exception as e:
+        _log("Year adjustment failed:", e)
+    return None, None
+
 
 def respond(message, history):
-    if message is None:
-        message = ""
+    sql = generate_sql(message)
+    cols, rows = execute_sql(sql)
 
-    # 1) Generate SQL from question
-    try:
-        sql = generate_sql(message)
-    except Exception as e:
-        sql = f"-- Error generating SQL: {e}"
+    adjusted_note = ""
+    if cols is not None and (not rows or len(rows) == 0):
+        adjusted_sql, latest = _try_adjust_year(sql)
+        if adjusted_sql:
+            _log(f"No rows for requested year; retrying with latest available year {latest}.")
+            sql = adjusted_sql
+            cols, rows = execute_sql(sql)
+            if rows and len(rows) > 0:
+                adjusted_note = f"\n\nNote: No rows for requested year; showing latest available year {latest}."
 
-    # 2) Try to execute and fetch sample rows
-    columns, rows = execute_sql(sql)
-
-    # 3) Generate natural-language explanation of the (intended) result
-    try:
-        explanation = generate_explanation(message, sql, columns, rows)
-    except Exception as e:
-        explanation = f"Failed to interpret result: {e}"
-
-    # 4) Build display payload: explanation first, then SQL, then small preview
-    preview_block = _preview_table(columns, rows) if columns is not None else "(DB not configured; set HAPPINESS_DB_PATH)"
-    display = (
-        f"Explanation:\n{explanation}\n\n"
-        #f"SQL:\n```sql\n{sql}\n```\n\n"
-        #f"Preview:\n{preview_block}"
+    explanation = explain_result(message, sql, cols, rows)
+    preview = preview_table(cols, rows)
+    final = (
+        f"**Explanation:** {explanation}"
+        f"{adjusted_note}\n\n"
+        f"```sql\n{sql}\n```\n\n"
+        f"{preview}"
     )
+    history = history + [(message, final)]
+    return history
 
-    # Print the final payload to console for visibility
-    _log("Final response payload:\n" + display)
+# Custom Theme + CSS
+CSS = """
+body {background-color:#0e0f13 !important;}
+.gradio-container {max-width:850px !important;margin:auto;}
+#chatbox .message.user {background:#2b2d31;color:white;border-radius:16px 16px 0 16px;padding:10px 14px;margin:6px 0;align-self:flex-end;max-width:80%;}
+#chatbox .message.bot {background:#1d1f24;color:#e3e3e3;border-radius:16px 16px 16px 0;padding:10px 14px;margin:6px 0;align-self:flex-start;max-width:80%;}
+#chatbox .message {display:flex;flex-direction:column;white-space:pre-wrap;font-family:Inter,system-ui,sans-serif;font-size:0.95rem;line-height:1.45;}
+#input-area textarea {background:#1a1b1f;color:white;border:none;border-radius:10px;padding:12px;font-size:0.95rem;}
+#input-area button {background:#10a37f;color:white;border:none;padding:10px 20px;border-radius:10px;font-weight:600;}
+#header {text-align:center;padding:20px 0;color:white;font-family:Inter,sans-serif;}
+"""
 
-    history = history + [(message, display)]
-    yield history
-
-
-# Gradio UI
-with gr.Blocks() as demo:
-    gr.Markdown("## World Happiness SQL Genie")
-    chatbot = gr.Chatbot()
-    with gr.Row():
-        msg = gr.Textbox(placeholder="Ask a question about World Happiness (e.g., rankings, averages, trends)...", lines=2)
-
-    # Example prompts
-    gr.Examples(
+# --- Gradio UI ---
+with gr.Blocks(css=CSS, analytics_enabled=False) as demo:
+    gr.HTML("<h1 id='header'>World Happiness Chat</h1>")
+    chatbot = gr.Chatbot(elem_id="chatbox", bubble_full_width=False, height=600)
+    with gr.Row(elem_id="input-area"):
+        msg = gr.Textbox(placeholder="Ask about happiness trends, rankings, averages...", lines=2, scale=4)
+        send = gr.Button("Send", scale=1)
+    examples = gr.Examples(
         examples=[
             "What were the top 5 happiest countries in 2019?",
-            "Show the average \"Score\" by year between 2015 and 2029, sorted descending.",
-            "Which country improved its rank the most between 2015 and 2019?",
-            "List the top 10 countries by \"Score\" and their \"GDP per capita\" in 2018.",
-            "For Finland, show \"Score\" over time.",
+            "Show the average \"Score\" per year between 2015 and 2019.",
+            "Which country improved the most between 2015 and 2019?",
+            "For Finland, show the happiness trend over the years.",
         ],
         inputs=msg,
     )
-
-    submit = gr.Button("Send")
-    clear = gr.Button("Clear Chat")
-
-    submit.click(respond, [msg, chatbot], [chatbot])
+    send.click(respond, [msg, chatbot], [chatbot])
     msg.submit(respond, [msg, chatbot], [chatbot])
-    clear.click(lambda: [], None, chatbot)
-
 
 if __name__ == "__main__":
     demo.launch(inbrowser=True)
