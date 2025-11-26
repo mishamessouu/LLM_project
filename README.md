@@ -21,4 +21,3 @@ This will launch the Gradio web UI and open it in your browser.
 
 ## Preprocessing (optional)
 If you need to (re)create the SQLite DB, use the scripts in `preprocessing/`. Ensure the output file is named `happiness.db` and placed as described above.
-
